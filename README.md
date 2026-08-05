@@ -54,11 +54,17 @@ The add-on page shows a live **proxy status line** (it pings the proxy every
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
 
+   Registering the auto-start task needs administrator rights, so expect a
+   **UAC prompt** (the script relaunches itself elevated; the task is still
+   registered for your user account). Node.js is located via PATH or, failing
+   that, the standard install folders (`Program Files\nodejs`, per-user
+   `AppData\Local\Programs\nodejs`).
+
    This copies the proxy to `%LOCALAPPDATA%\RazerKeyLightChroma`, registers a
    scheduled task (`RazerKeyLightChromaProxy`) that **starts it hidden at every
    logon**, and starts it immediately. The proxy idles (no connections held)
    whenever SignalRGB isn't streaming, so it is safe to leave running.
-   To remove it later: `.\install.ps1 -Uninstall`.
+   To remove it later: `.\install.ps1 -Uninstall` (also prompts for elevation).
 
 2. Install the add-on from a public Git repository copy of these files,
    keeping the same base names (`RazerKeyLightChroma.js` / `.qml`):
