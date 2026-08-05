@@ -4,63 +4,75 @@ This is an **unverified prototype** derived from an audit of
 `thepolishdane/simple-razer-keylight-chroma-controller` and SignalRGB's public
 network add-on examples/documentation.
 
-It directly controls each Razer Key Light Chroma over TCP port `10003`.
-It does **not** require Synapse or the original Python controller while running.
+It controls each Razer Key Light Chroma over its TCP protocol (port `10003`)
+without requiring Synapse or the original Python controller while running.
 
-## Why this is separate from the Python project
+## Architecture: add-on + companion proxy
 
-The audited project is well suited to buttons, presets, and occasional state
-changes. Its current `/set` path writes JSON to disk, opens a new TCP connection,
-performs the full handshake, and sends the complete white/RGB state for each
-update. That architecture will drop frames and add latency if driven at music
-visualizer rates.
+SignalRGB's add-on runtime cannot open raw TCP connections. The
+`@SignalRGB/tcp` module in SignalRGB's developer docs does not resolve inside
+installed add-ons ("could not open module ... @SignalRGB/tcp for reading"),
+and every shipped network add-on (Govee, Yeelight, MagicHome, Cololight) uses
+UDP only. Official add-ons for TCP-based devices either use UDP protocol
+variants or remain unreleased, and community projects work around the gap with
+companion processes (see `signalrgb-hue-bridge-pro`'s localhost proxy).
 
-This add-on instead:
+So this project has two parts:
 
-- creates one SignalRGB device per manually entered Key Light IP;
-- keeps a TCP connection open;
-- performs the reverse-engineered hello and registration handshake once;
-- samples one color from SignalRGB's canvas;
-- sends only changed RGB values;
-- drains device responses;
-- reconnects after an error.
+- **`RazerKeyLightChroma.js` / `.qml`** — the SignalRGB add-on. It builds the
+  ready-to-send 105-byte protocol packets and streams them over **loopback
+  UDP** (`127.0.0.1:10077`) using `@SignalRGB/udp`, the one networking module
+  proven to work in shipped add-ons. One SignalRGB device per manually entered
+  Key Light IP; only changed colors are sent, with a full state refresh every
+  2 seconds.
+- **`proxy/keylight-proxy.js`** — a dependency-free Node.js process that owns
+  one persistent TCP connection per light, performs the reverse-engineered
+  hello/registration handshake, forwards the add-on's packets verbatim, and
+  drains device responses. It opens a light's connection on the first packet
+  for it and closes it again after 30 seconds without traffic — so when
+  SignalRGB exits (or a light is removed), the light is released for Synapse
+  or other controllers automatically.
 
-The Key Light Chroma appears to be a **single RGB zone**, so each physical panel
-is represented as one canvas LED.
+The add-on page shows a live **proxy status line** (it pings the proxy every
+5 seconds), so a missing proxy is visible instead of silently doing nothing.
 
 ## Prerequisites
 
-1. Give each Key Light a DHCP reservation/static lease in your router.
-2. Fully exit Razer Synapse, Razer Streaming, and the original Python controller.
+1. [Node.js 18+](https://nodejs.org) on the PC running SignalRGB (for the proxy).
+2. Give each Key Light a DHCP reservation/static lease in your router.
+3. Fully exit Razer Synapse, Razer Streaming, and the original Python controller.
    The light's control service appears to tolerate only one active controller.
-3. If a light becomes wedged, unplug it for about 20 seconds, reconnect it, and
+4. If a light becomes wedged, unplug it for about 20 seconds, reconnect it, and
    allow roughly a minute for Wi-Fi reconnection.
 
 ## Installation
 
-SignalRGB network integrations are installed as add-ons from a repository.
+1. Install the companion proxy (from a clone of this repository, or from the
+   add-on cache folder after step 2):
 
-1. Put these files in a public Git repository, keeping the same base name:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1
+   ```
 
-   - `RazerKeyLightChroma.js`
-   - `RazerKeyLightChroma.qml`
+   This copies the proxy to `%LOCALAPPDATA%\RazerKeyLightChroma`, registers a
+   scheduled task (`RazerKeyLightChromaProxy`) that **starts it hidden at every
+   logon**, and starts it immediately. The proxy idles (no connections held)
+   whenever SignalRGB isn't streaming, so it is safe to leave running.
+   To remove it later: `.\install.ps1 -Uninstall`.
 
-2. Open this URI in Windows, replacing the repository URL:
+2. Install the add-on from a public Git repository copy of these files,
+   keeping the same base names (`RazerKeyLightChroma.js` / `.qml`):
 
    `signalrgb://addon/install?url=https://gitlab.com/YOUR_ACCOUNT/YOUR_REPOSITORY`
 
-3. Approve the installation in SignalRGB.
-4. Open the Razer Key Light Chroma add-on page.
+3. Approve the installation in SignalRGB and restart it.
+4. Open the Razer Key Light Chroma add-on page. The status line should read
+   **"Proxy online"**.
 5. Add each light's IPv4 address.
 6. Restart SignalRGB if a newly added controller does not appear immediately.
-7. Put the two Key Light devices into your SignalRGB layout, one on the left and
-   one on the right.
+7. Put the Key Light devices into your SignalRGB layout.
 8. Start with an update interval of **100 ms (10 Hz)**. If stable, reduce it to
    **50 ms (20 Hz)**.
-
-SignalRGB's current public add-ons use a `.js` service/device file plus a
-same-named `.qml` configuration interface. The add-on URI format above is the
-same format used by SignalRGB's official Govee add-on.
 
 ## Safe first test
 
@@ -72,33 +84,45 @@ same format used by SignalRGB's official Govee add-on.
 After five to ten minutes without disconnects, try a music visualizer and then
 lower the update interval to `50 ms`.
 
+## Proxy configuration (optional)
+
+Environment variables read by `keylight-proxy.js`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KEYLIGHT_PROXY_PORT` | `10077` | Loopback UDP port the add-on sends to |
+| `KEYLIGHT_TCP_PORT` | `10003` | TCP port of the lights |
+| `KEYLIGHT_IDLE_MS` | `30000` | Idle time before a light's TCP session is released |
+| `KEYLIGHT_PROXY_LOG` | `keylight-proxy.log` next to the script | Log file path; empty string disables |
+
+If you change `KEYLIGHT_PROXY_PORT`, change `PROXY_PORT` in
+`RazerKeyLightChroma.js` to match.
+
 ## Known uncertainties
 
 - This has not been hardware-tested in this environment.
-- The original project reconnects for every state push. Persistent streaming is
-  the right architecture for SignalRGB, but the Key Light firmware may impose a
-  lower practical frame rate or periodically close the socket.
-- SignalRGB's add-on APIs evolve. If the add-on fails to load, inspect the latest
-  SignalRGB log and compare the service/controller calls with a currently
-  installed network add-on such as Govee or Philips Hue.
+- The Key Light firmware may impose a lower practical frame rate or
+  periodically close the socket; the proxy reconnects on demand and the add-on
+  re-pushes full state every 2 seconds.
+- SignalRGB's add-on APIs evolve. If SignalRGB ships `@SignalRGB/tcp` for
+  add-ons in the future, the proxy can be retired.
 - The audited repository has no explicit software license. Obtain permission
-  from its author before distributing a derivative implementation. Protocol
-  interoperability facts can be reimplemented independently, but do not copy
-  and republish the original application wholesale without permission.
+  from its author before distributing a derivative implementation.
 
 ## Troubleshooting
 
-- **`could not open module ...@SignalRGB/tcp for reading`:** the add-on runtime
-  only accepts the default-import form used by SignalRGB's official add-ons
-  (`import tcp from "@SignalRGB/tcp";`, no curly braces). If the import is
-  already correct and the error persists, your SignalRGB is older than the
-  `@SignalRGB/tcp` module; update SignalRGB (the official MagicHome add-on
-  requires the same module).
-- **No device appears:** verify the `.js` and `.qml` names match and inspect the
-  SignalRGB logs.
-- **Connection refused:** verify the IP and test TCP port `10003`.
-- **Light disconnects repeatedly:** return to `100 ms`, close every other Razer
-  controller, and power-cycle the light.
+- **Status line says "Proxy offline":** the proxy isn't running. Re-run
+  `install.ps1`, or start it by hand with
+  `node "%LOCALAPPDATA%\RazerKeyLightChroma\keylight-proxy.js"` and watch its
+  output. Check Task Scheduler for the `RazerKeyLightChromaProxy` task.
+- **Proxy online but the light stays dark:** check the proxy log
+  (`%LOCALAPPDATA%\RazerKeyLightChroma\keylight-proxy.log`) for TCP errors —
+  wrong IP, light offline, or another controller (Synapse) holding the
+  connection. Verify the IP and test TCP port `10003`.
+- **No device appears:** verify the `.js` and `.qml` names match and inspect
+  the SignalRGB logs.
+- **Light disconnects repeatedly:** return to `100 ms`, close every other
+  Razer controller, and power-cycle the light.
 - **Colors update but music feels delayed:** try `50 ms`; do not immediately
   jump below `33 ms`.
 - **Light is stuck on but still pings:** the audited project's changelog notes

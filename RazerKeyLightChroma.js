@@ -1,7 +1,7 @@
-import tcp from "@SignalRGB/tcp";
+import udp from "@SignalRGB/udp";
 
 export function Name() { return "Razer Key Light Chroma"; }
-export function Version() { return "0.1.0"; }
+export function Version() { return "0.2.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Community prototype"; }
 export function Size() { return [1, 1]; }
@@ -14,6 +14,7 @@ export function ImageUrl() {
 
 /* global
 controller:readonly
+discovery:readonly
 LightingMode:readonly
 forcedColor:readonly
 chromaBrightness:readonly
@@ -98,34 +99,43 @@ const LED_POSITIONS = [[0, 0]];
 export function LedNames() { return LED_NAMES; }
 export function LedPositions() { return LED_POSITIONS; }
 
-const RAZER_PORT = 10003;
-const HELLO_PACKET = [
-    0xaa, 0x00, 0x00, 0x13, 0x02, 0x09, 0x12, 0x02, 0x20, 0x26,
-    0x01, 0x09, 0x00, 0x11, 0x00, 0x00, 0x40, 0x15, 0x00
-];
-const REG_PAYLOAD = hexToBytes("48004901d45d645125220853796e6170736533");
+// The add-on runtime cannot open raw TCP sockets, so all device traffic is
+// relayed through the companion proxy (proxy/keylight-proxy.js) over loopback
+// UDP. The proxy owns the persistent TCP connection and the
+// hello/registration handshake; this file only builds protocol packets.
+const PROXY_HOST = "127.0.0.1";
+const PROXY_PORT = 10077;
 
-let socket = null;
-let protocolState = "disconnected";
-let lastConnectAttempt = 0;
+// Re-push the full state periodically so a restarted proxy or power-cycled
+// light recovers without user action. Also serves as the proxy's signal that
+// SignalRGB is still alive (its idle timeout releases the light otherwise).
+const FORCE_RESEND_MS = 2000;
+
+let proxySocket = null;
 let lastColor = [-1, -1, -1];
 let lastConfig = "";
-let reconnectDelayMs = 2000;
+let lastPushAt = 0;
 
 export function Initialize() {
     device.setName(`Razer Key Light Chroma (${controller.ip})`);
-    connect();
+
+    proxySocket = udp.createSocket();
+    proxySocket.on("error", (code, message) => {
+        device.log(`Proxy socket error: ${code} - ${message}`);
+    });
+    proxySocket.on("connection", () => {
+        device.log(`Streaming to key light proxy at ${PROXY_HOST}:${PROXY_PORT}`);
+    });
+    proxySocket.bind(0);
+    proxySocket.connect(PROXY_HOST, PROXY_PORT);
 }
 
 export function Render() {
-    if (protocolState !== "ready") {
-        reconnectIfNeeded();
-        device.pause(100);
-        return;
-    }
+    const now = Date.now();
+    const forceResend = now - lastPushAt >= FORCE_RESEND_MS;
 
     const configKey = `${chromaBrightness}|${mainBrightness}|${colorTemperature}`;
-    if (configKey !== lastConfig) {
+    if (forceResend || configKey !== lastConfig) {
         sendConfiguration();
         lastConfig = configKey;
     }
@@ -134,111 +144,61 @@ export function Render() {
         ? hexToRgb(forcedColor)
         : device.color(0, 0);
 
-    if (colorChanged(color, lastColor)) {
+    if (forceResend || colorChanged(color, lastColor)) {
         sendPacket(buildPacket("C_RGB", 0, color));
         lastColor = [color[0], color[1], color[2]];
+        lastPushAt = now;
     }
 
     device.pause(clampInt(updateIntervalMs, 33, 250));
 }
 
 export function Shutdown() {
-    if (protocolState === "ready" && turnOffOnShutdown) {
+    if (proxySocket === null) {
+        return;
+    }
+
+    if (turnOffOnShutdown) {
         sendPacket(buildPacket("C_BRIGHT", 0));
         sendPacket(buildPacket("C_RGB", 0, [0, 0, 0]));
     }
 
-    closeSocket();
-}
+    // Release the light immediately so Synapse or another controller can
+    // take over without waiting for the proxy's idle timeout.
+    sendToProxy({ ip: controller.ip, cmd: "disconnect" });
 
-function connect() {
-    closeSocket();
-
-    protocolState = "connecting";
-    lastConnectAttempt = Date.now();
-    socket = tcp.createSocket();
-
-    // Event names follow the official SignalRGB TCP add-ons (MagicHome):
-    // "connection", "message", and "error".
-    socket.on("connection", () => {
-        device.log(`Connected to Key Light at ${controller.ip}:${RAZER_PORT}`);
-        protocolState = "hello-sent";
-        socket.send(HELLO_PACKET);
-    });
-
-    socket.on("message", (msg) => {
-        // Reading every response is important for a persistent connection.
-        // The original project used blocking recv() calls for the hello and
-        // registration responses, then closed the socket after each state push.
-        if (protocolState === "hello-sent") {
-            protocolState = "registration-sent";
-            socket.send(buildPacket("REG"));
-            return;
-        }
-
-        if (protocolState === "registration-sent") {
-            protocolState = "ready";
-            // Resetting these makes the next Render() push the full
-            // configuration and current color exactly once.
-            lastConfig = "";
-            lastColor = [-1, -1, -1];
-            device.log("Key Light protocol registration completed.");
-            return;
-        }
-
-        // Subsequent replies are intentionally consumed and ignored.
-        void msg;
-    });
-
-    socket.on("error", (code, message) => {
-        device.log(`Key Light socket error: ${code} - ${message}`);
-        protocolState = "disconnected";
-    });
-
-    socket.bind(0);
-    socket.connect(controller.ip, RAZER_PORT);
-}
-
-function reconnectIfNeeded() {
-    if (Date.now() - lastConnectAttempt >= reconnectDelayMs) {
-        connect();
-    }
-}
-
-function closeSocket() {
-    if (socket !== null) {
-        try {
-            socket.disconnect();
-            socket.close();
-        } catch (e) {
-            device.log(`Socket close warning: ${e}`);
-        }
+    try {
+        proxySocket.disconnect();
+        proxySocket.close();
+    } catch (e) {
+        device.log(`Proxy socket close warning: ${e}`);
     }
 
-    socket = null;
-    protocolState = "disconnected";
+    proxySocket = null;
 }
 
 function sendConfiguration() {
-    if (protocolState !== "ready") {
-        return;
-    }
-
     // Keep the white panel at or below 15% while Chroma is active.
     const whitePct = clampInt(mainBrightness, 0, 15);
     const chromaPct = clampInt(chromaBrightness, 1, 100);
     const temperature = clampInt(colorTemperature, 3000, 7000);
 
     sendPacket(buildPacket("BRIGHT", percentToByte(whitePct)));
-    device.pause(20);
     sendPacket(buildPacket("TEMP", temperature));
-    device.pause(20);
     sendPacket(buildPacket("C_BRIGHT", percentToByte(chromaPct)));
 }
 
 function sendPacket(packet) {
-    if (socket !== null && protocolState === "ready") {
-        socket.send(packet);
+    sendToProxy({ ip: controller.ip, data: packet });
+}
+
+function sendToProxy(message) {
+    if (proxySocket === null) {
+        return;
+    }
+
+    if (proxySocket.send(JSON.stringify(message)) === -1) {
+        device.log("Failed to send datagram to key light proxy.");
     }
 }
 
@@ -247,9 +207,6 @@ function buildPacket(command, value = 0, rgb = null) {
     let payload = [];
 
     switch (command) {
-        case "REG":
-            payload = REG_PAYLOAD.slice();
-            break;
         case "BRIGHT":
             payload = [0x03, 0x03, 0x03, 0x00, 0x20, clampInt(value, 0, 255)];
             break;
@@ -306,14 +263,6 @@ function clampInt(value, min, max) {
     return Math.max(min, Math.min(max, parsed));
 }
 
-function hexToBytes(hex) {
-    const result = [];
-    for (let i = 0; i < hex.length; i += 2) {
-        result.push(parseInt(hex.substring(i, i + 2), 16));
-    }
-    return result;
-}
-
 function hexToRgb(hex) {
     const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
     if (!match) {
@@ -329,16 +278,25 @@ function hexToRgb(hex) {
 
 // ----------------------------- Discovery service -----------------------------
 
+const PING_INTERVAL_MS = 5000;
+const PONG_TIMEOUT_MS = 12000;
+
 export function DiscoveryService() {
     this.IconUrl = "https://assets.signalrgb.com/brands/razer/logo.png";
     this.storageId = "razer-key-light-chroma";
     this.storageKey = "configured-ips";
     this.initialized = false;
 
+    this.pingSocket = null;
+    this.lastPingAt = 0;
+    this.lastPongAt = 0;
+    this.proxyVersion = "";
+    this.proxySessions = 0;
+
     this.Initialize = function() {
         this.initialized = true;
-        const saved = service.getSetting(this.storageId, this.storageKey);
 
+        const saved = service.getSetting(this.storageId, this.storageKey);
         if (saved !== undefined) {
             try {
                 const ips = JSON.parse(saved);
@@ -349,14 +307,85 @@ export function DiscoveryService() {
                 service.log(`Unable to parse saved Key Light IPs: ${e}`);
             }
         }
+
+        const instance = this;
+        this.pingSocket = udp.createSocket();
+        this.pingSocket.on("error", (code, message) => {
+            service.log(`Proxy ping socket error: ${code} - ${message}`);
+        });
+        this.pingSocket.on("message", (msg) => {
+            instance.handleProxyMessage(msg);
+        });
+        this.pingSocket.bind(0);
+        this.pingSocket.connect(PROXY_HOST, PROXY_PORT);
+
+        this.pingProxy();
     };
 
     this.Update = function() {
-        // Devices are entered manually because the reverse-engineered project
-        // does not document a discovery broadcast.
+        if (Date.now() - this.lastPingAt >= PING_INTERVAL_MS) {
+            this.pingProxy();
+        }
     };
 
-    this.Shutdown = function() {};
+    this.Shutdown = function() {
+        if (this.pingSocket !== null) {
+            try {
+                this.pingSocket.disconnect();
+                this.pingSocket.close();
+            } catch (e) {
+                service.log(`Proxy ping socket close warning: ${e}`);
+            }
+            this.pingSocket = null;
+        }
+    };
+
+    this.pingProxy = function() {
+        this.lastPingAt = Date.now();
+        if (this.pingSocket !== null) {
+            this.pingSocket.send(JSON.stringify({ cmd: "ping" }));
+        }
+    };
+
+    this.handleProxyMessage = function(msg) {
+        // Shipped add-ons receive datagram text as msg.response (Govee);
+        // fall back to msg.data for runtimes that deliver byte arrays.
+        const raw = msg?.response ?? msg?.data ?? msg;
+        let text = raw;
+        if (Array.isArray(raw)) {
+            text = String.fromCharCode(...raw);
+        }
+
+        try {
+            const reply = JSON.parse(text);
+            if (reply.cmd === "pong") {
+                this.lastPongAt = Date.now();
+                this.proxyVersion = String(reply.version ?? "");
+                this.proxySessions = Object.keys(reply.sessions ?? {}).length;
+            }
+        } catch (e) {
+            void e; // not a proxy reply; ignore
+        }
+    };
+
+    // Read by the QML page.
+    this.proxyStatusText = function() {
+        if (this.lastPongAt !== 0 && Date.now() - this.lastPongAt <= PONG_TIMEOUT_MS) {
+            const version = this.proxyVersion !== "" ? ` v${this.proxyVersion}` : "";
+            const lights = this.proxySessions === 1 ? "1 light connected" : `${this.proxySessions} lights connected`;
+            return `Proxy online${version} — ${lights}`;
+        }
+
+        if (this.lastPingAt === 0) {
+            return "Checking for proxy…";
+        }
+
+        return "Proxy offline — run install.ps1 (or: node keylight-proxy.js)";
+    };
+
+    this.proxyOnline = function() {
+        return this.lastPongAt !== 0 && Date.now() - this.lastPongAt <= PONG_TIMEOUT_MS;
+    };
 
     this.addKeyLight = function(ipAddress) {
         const ip = String(ipAddress || "").trim();
