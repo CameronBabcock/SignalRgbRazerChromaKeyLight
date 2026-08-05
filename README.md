@@ -77,18 +77,19 @@ The add-on page shows a live **proxy status line** (it pings the proxy every
 5. Add each light's IPv4 address.
 6. Restart SignalRGB if a newly added controller does not appear immediately.
 7. Put the Key Light devices into your SignalRGB layout.
-8. Start with an update interval of **100 ms (10 Hz)**. If stable, reduce it to
-   **50 ms (20 Hz)**.
+8. The default frame pacing of **15 ms (~60 FPS, SignalRGB's render cap)**
+   should be right for most setups. If the light stutters or drops off Wi-Fi,
+   raise it (33 ms, then 50 ms) until stable.
 
 ## Safe first test
 
 - White Panel Brightness: `0%`
 - Chroma Brightness: `25%`
-- Update Interval: `100 ms`
+- Frame Pacing: `15 ms` (default)
 - Effect: a slow color cycle
 
-After five to ten minutes without disconnects, try a music visualizer and then
-lower the update interval to `50 ms`.
+After five to ten minutes without disconnects, try a music visualizer. Only
+raise the pacing if the light stutters or disconnects.
 
 ## Proxy configuration (optional)
 
@@ -99,6 +100,7 @@ Environment variables read by `keylight-proxy.js`:
 | `KEYLIGHT_PROXY_PORT` | `10077` | Loopback UDP port the add-on sends to |
 | `KEYLIGHT_TCP_PORT` | `10003` | TCP port of the lights |
 | `KEYLIGHT_IDLE_MS` | `30000` | Idle time before a light's TCP session is released |
+| `KEYLIGHT_SEND_SPACING_MS` | `0` | Optional delay between TCP packets; only for debugging a light that can't keep up |
 | `KEYLIGHT_PROXY_LOG` | `keylight-proxy.log` next to the script | Log file path; empty string disables |
 
 If you change `KEYLIGHT_PROXY_PORT`, change `PROXY_PORT` in
@@ -127,9 +129,9 @@ If you change `KEYLIGHT_PROXY_PORT`, change `PROXY_PORT` in
   connection. Verify the IP and test TCP port `10003`.
 - **No device appears:** verify the `.js` and `.qml` names match and inspect
   the SignalRGB logs.
-- **Light disconnects repeatedly:** return to `100 ms`, close every other
-  Razer controller, and power-cycle the light.
-- **Colors update but music feels delayed:** try `50 ms`; do not immediately
-  jump below `33 ms`.
+- **Light disconnects repeatedly:** raise frame pacing (33 ms, then 50 ms),
+  close every other Razer controller, and power-cycle the light.
+- **Colors feel delayed:** make sure frame pacing is at the default 15 ms and
+  `KEYLIGHT_SEND_SPACING_MS` is unset; both add latency when raised.
 - **Light is stuck on but still pings:** the audited project's changelog notes
   that ICMP ping is not a reliable health test; the TCP control port is.

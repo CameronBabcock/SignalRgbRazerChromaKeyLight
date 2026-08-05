@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "Razer Key Light Chroma"; }
-export function Version() { return "0.2.0"; }
+export function Version() { return "0.3.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Community prototype"; }
 export function Size() { return [1, 1]; }
@@ -75,13 +75,13 @@ export function ControllableParameters() {
         {
             property: "updateIntervalMs",
             group: "settings",
-            label: "Update Interval (ms)",
-            description: "Start at 100 ms. Try 50 ms after confirming the light remains stable.",
+            label: "Frame Pacing (ms)",
+            description: "15 ms ≈ 60 FPS, SignalRGB's render cap. Raise this only if the light stutters or drops off Wi-Fi.",
             type: "number",
-            min: 33,
+            min: 5,
             max: 250,
             step: 1,
-            default: 100
+            default: 15
         },
         {
             property: "turnOffOnShutdown",
@@ -150,7 +150,7 @@ export function Render() {
         lastPushAt = now;
     }
 
-    device.pause(clampInt(updateIntervalMs, 33, 250));
+    device.pause(clampInt(updateIntervalMs, 5, 250));
 }
 
 export function Shutdown() {

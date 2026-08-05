@@ -31,14 +31,22 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const LISTEN_HOST = "127.0.0.1";
 const LISTEN_PORT = parseInt(process.env.KEYLIGHT_PROXY_PORT || "10077", 10);
 const LIGHT_TCP_PORT = parseInt(process.env.KEYLIGHT_TCP_PORT || "10003", 10);
 const IDLE_MS = parseInt(process.env.KEYLIGHT_IDLE_MS || "30000", 10);
 const RECONNECT_COOLDOWN_MS = 2000;
-const SEND_SPACING_MS = 15; // pacing between TCP packets, mirrors the add-on's old 20 ms pauses
+// Optional pacing between TCP packets. Default 0: packets are framed
+// (fixed 105 bytes) and the socket has NoDelay, so spacing only adds latency.
+const SEND_SPACING_MS = parseInt(process.env.KEYLIGHT_SEND_SPACING_MS || "0", 10);
 const QUEUE_LIMIT = 16;
+
+// C_RGB packets supersede each other: if one is already waiting (e.g. during
+// the handshake), replace it instead of queueing a stale color behind it.
+function isColorPacket(bytes) {
+    return bytes[10] === 0x0c && bytes[11] === 0x0f && bytes[12] === 0x02;
+}
 
 // ----------------------------- logging --------------------------------------
 
@@ -155,6 +163,16 @@ class Session {
 
     enqueue(bytes) {
         this.lastActivity = Date.now();
+
+        if (isColorPacket(bytes)) {
+            const waitingColor = this.queue.findIndex(isColorPacket);
+            if (waitingColor !== -1) {
+                this.queue[waitingColor] = bytes;
+                this.drain();
+                return;
+            }
+        }
+
         this.queue.push(bytes);
         if (this.queue.length > QUEUE_LIMIT) {
             this.queue.shift();
@@ -164,6 +182,15 @@ class Session {
 
     drain() {
         if (this.draining || this.state !== "ready" || this.closed) {
+            return;
+        }
+
+        if (SEND_SPACING_MS <= 0) {
+            // Flush everything back-to-back; the light parses fixed-size frames.
+            let packet;
+            while ((packet = this.queue.shift()) !== undefined) {
+                this.socket.write(Buffer.from(packet));
+            }
             return;
         }
 
