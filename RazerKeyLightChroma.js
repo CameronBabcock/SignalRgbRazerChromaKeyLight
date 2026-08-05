@@ -1,7 +1,7 @@
-import { tcp } from "@SignalRGB/tcp";
+import tcp from "@SignalRGB/tcp";
 
 export function Name() { return "Razer Key Light Chroma"; }
-export function Version() { return "0.1.0"; }
+export function Version() { return "0.5.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Community prototype"; }
 export function Size() { return [1, 1]; }
@@ -21,6 +21,8 @@ mainBrightness:readonly
 colorTemperature:readonly
 updateIntervalMs:readonly
 turnOffOnShutdown:readonly
+device:readonly
+service:readonly
 */
 
 export function ControllableParameters() {
@@ -99,6 +101,9 @@ export function LedNames() { return LED_NAMES; }
 export function LedPositions() { return LED_POSITIONS; }
 
 const RAZER_PORT = 10003;
+const DISCOVERY_HELPER_HOST = "127.0.0.1";
+const DISCOVERY_HELPER_PORT = 10004;
+
 const HELLO_PACKET = [
     0xaa, 0x00, 0x00, 0x13, 0x02, 0x09, 0x12, 0x02, 0x20, 0x26,
     0x01, 0x09, 0x00, 0x11, 0x00, 0x00, 0x40, 0x15, 0x00
@@ -110,10 +115,14 @@ let protocolState = "disconnected";
 let lastConnectAttempt = 0;
 let lastColor = [-1, -1, -1];
 let lastConfig = "";
-let reconnectDelayMs = 2000;
+let pendingPackets = [];
+let nextPacketAt = 0;
+const reconnectDelayMs = 2000;
+const configurationPacketGapMs = 25;
 
 export function Initialize() {
     device.setName(`Razer Key Light Chroma (${controller.ip})`);
+    device.setImageFromUrl(controller.deviceImage);
     connect();
 }
 
@@ -126,8 +135,21 @@ export function Render() {
 
     const configKey = `${chromaBrightness}|${mainBrightness}|${colorTemperature}`;
     if (configKey !== lastConfig) {
-        sendConfiguration();
+        queueConfiguration();
         lastConfig = configKey;
+    }
+
+    // Send configuration commands one frame at a time. The previous prototype
+    // called device.pause() from an asynchronous socket callback, which is not
+    // how SignalRGB's own add-ons use pause().
+    if (pendingPackets.length > 0) {
+        if (Date.now() >= nextPacketAt) {
+            sendPacket(pendingPackets.shift());
+            nextPacketAt = Date.now() + configurationPacketGapMs;
+        }
+
+        device.pause(configurationPacketGapMs);
+        return;
     }
 
     const color = LightingMode === "Forced"
@@ -144,8 +166,9 @@ export function Render() {
 
 export function Shutdown() {
     if (protocolState === "ready" && turnOffOnShutdown) {
+        // One command is sufficient to disable the RGB panel. Avoid trying to
+        // pace multiple packets while SignalRGB is already shutting down.
         sendPacket(buildPacket("C_BRIGHT", 0));
-        sendPacket(buildPacket("C_RGB", 0, [0, 0, 0]));
     }
 
     closeSocket();
@@ -156,6 +179,7 @@ function connect() {
 
     protocolState = "connecting";
     lastConnectAttempt = Date.now();
+    pendingPackets = [];
     socket = tcp.createSocket();
 
     socket.on("connected", () => {
@@ -165,9 +189,6 @@ function connect() {
     });
 
     socket.on("message", (data) => {
-        // Reading every response is important for a persistent connection.
-        // The original project used blocking recv() calls for the hello and
-        // registration responses, then closed the socket after each state push.
         if (protocolState === "hello-sent") {
             protocolState = "registration-sent";
             socket.send(buildPacket("REG"));
@@ -178,30 +199,38 @@ function connect() {
             protocolState = "ready";
             lastConfig = "";
             lastColor = [-1, -1, -1];
-            sendConfiguration();
+            queueConfiguration();
             device.log("Key Light protocol registration completed.");
             return;
         }
 
-        // Subsequent replies are intentionally consumed and ignored.
+        // Normal command replies are deliberately consumed and ignored.
         void data;
     });
 
     socket.on("disconnected", () => {
         device.log("Key Light disconnected.");
         protocolState = "disconnected";
+        pendingPackets = [];
+        lastConnectAttempt = Date.now();
     });
 
-    socket.on("error", (err) => {
-        device.log(`Key Light socket error: ${err}`);
+    socket.on("error", (code, message) => {
+        const details = message === undefined ? code : `${code}: ${message}`;
+        device.log(`Key Light socket error: ${details}`);
         protocolState = "disconnected";
+        pendingPackets = [];
+        lastConnectAttempt = Date.now();
     });
 
     socket.connect(controller.ip, RAZER_PORT);
 }
 
 function reconnectIfNeeded() {
-    if (Date.now() - lastConnectAttempt >= reconnectDelayMs) {
+    if (
+        protocolState === "disconnected" &&
+        Date.now() - lastConnectAttempt >= reconnectDelayMs
+    ) {
         connect();
     }
 }
@@ -217,27 +246,32 @@ function closeSocket() {
 
     socket = null;
     protocolState = "disconnected";
+    pendingPackets = [];
 }
 
-function sendConfiguration() {
+function queueConfiguration() {
     if (protocolState !== "ready") {
         return;
     }
 
-    // Keep the white panel at or below 15% while Chroma is active.
     const whitePct = clampInt(mainBrightness, 0, 15);
     const chromaPct = clampInt(chromaBrightness, 1, 100);
     const temperature = clampInt(colorTemperature, 3000, 7000);
 
-    sendPacket(buildPacket("BRIGHT", percentToByte(whitePct)));
-    device.pause(20);
-    sendPacket(buildPacket("TEMP", temperature));
-    device.pause(20);
-    sendPacket(buildPacket("C_BRIGHT", percentToByte(chromaPct)));
+    pendingPackets = [
+        buildPacket("BRIGHT", percentToByte(whitePct)),
+        buildPacket("TEMP", temperature),
+        buildPacket("C_BRIGHT", percentToByte(chromaPct))
+    ];
+    nextPacketAt = 0;
 }
 
 function sendPacket(packet) {
-    if (socket !== null && protocolState === "ready") {
+    if (
+        socket !== null &&
+        protocolState === "ready" &&
+        socket.state === socket.ConnectedState
+    ) {
         socket.send(packet);
     }
 }
@@ -277,8 +311,6 @@ function buildPacket(command, value = 0, rgb = null) {
 
     const packet = header.concat(payload);
 
-    // The reverse-engineered protocol pads the packet to 103 bytes before
-    // appending an XOR checksum and trailing zero, for 105 bytes total.
     while (packet.length < 103) {
         packet.push(0x00);
     }
@@ -327,36 +359,166 @@ function hexToRgb(hex) {
     ];
 }
 
+function socketDataToString(data) {
+    if (typeof data === "string") {
+        return data;
+    }
+
+    let text = "";
+    for (let i = 0; i < data.length; i++) {
+        text += String.fromCharCode(data[i]);
+    }
+    return text;
+}
+
 // ----------------------------- Discovery service -----------------------------
 
 export function DiscoveryService() {
     this.IconUrl = "https://assets.signalrgb.com/brands/razer/logo.png";
     this.storageId = "razer-key-light-chroma";
     this.storageKey = "configured-ips";
-    this.initialized = false;
+
+    this.scanStatus = "Waiting for discovery.";
+    this.helperSocket = null;
+    this.helperBuffer = "";
+    this.helperCompleted = false;
+    this.autoDiscoveryPending = true;
+    this.autoDiscoveryAt = Date.now() + 1500;
 
     this.Initialize = function() {
-        this.initialized = true;
-        const saved = service.getSetting(this.storageId, this.storageKey);
-
-        if (saved !== undefined) {
-            try {
-                const ips = JSON.parse(saved);
-                for (const ip of ips) {
-                    this.createController(ip);
-                }
-            } catch (e) {
-                service.log(`Unable to parse saved Key Light IPs: ${e}`);
-            }
+        for (const ip of this.getSavedIps()) {
+            this.createController(ip);
         }
+
+        this.scanStatus = "Loaded saved Key Lights. Auto-discovery will start shortly.";
     };
 
     this.Update = function() {
-        // Devices are entered manually because the reverse-engineered project
-        // does not document a discovery broadcast.
+        if (this.autoDiscoveryPending && Date.now() >= this.autoDiscoveryAt) {
+            this.autoDiscoveryPending = false;
+            this.requestAutoDiscovery();
+        }
+
+        for (const controllerEntry of service.controllers) {
+            controllerEntry.obj.update();
+        }
     };
 
-    this.Shutdown = function() {};
+    this.Shutdown = function() {
+        this.closeHelperSocket();
+    };
+
+    this.requestAutoDiscovery = function() {
+        this.requestHelperScan("SCAN");
+    };
+
+    this.scanCidr = function(cidrValue) {
+        const cidr = String(cidrValue || "").trim();
+        if (!isValidCidr(cidr)) {
+            this.scanStatus = `Invalid CIDR: ${cidr}`;
+            service.log(this.scanStatus);
+            return;
+        }
+
+        this.requestHelperScan(`SCAN_CIDR ${cidr}`);
+    };
+
+    this.requestHelperScan = function(command) {
+        this.closeHelperSocket();
+
+        this.helperBuffer = "";
+        this.helperCompleted = false;
+        this.scanStatus = command === "SCAN"
+            ? "Scanning active Windows IPv4 subnets..."
+            : `Scanning ${command.substring("SCAN_CIDR ".length)}...`;
+
+        const helperSocket = tcp.createSocket();
+        this.helperSocket = helperSocket;
+
+        helperSocket.on("connected", () => {
+            service.log(`Connected to Key Light discovery helper on ${DISCOVERY_HELPER_HOST}:${DISCOVERY_HELPER_PORT}`);
+            helperSocket.send(`${command}\n`);
+        });
+
+        helperSocket.on("message", (data) => {
+            this.helperBuffer += socketDataToString(data);
+
+            let newlineIndex = this.helperBuffer.indexOf("\n");
+            while (newlineIndex >= 0) {
+                const line = this.helperBuffer.substring(0, newlineIndex).trim();
+                this.helperBuffer = this.helperBuffer.substring(newlineIndex + 1);
+
+                if (line.length > 0) {
+                    this.handleHelperMessage(line);
+                }
+
+                newlineIndex = this.helperBuffer.indexOf("\n");
+            }
+        });
+
+        helperSocket.on("error", (err) => {
+            if (!this.helperCompleted) {
+                this.scanStatus = "Discovery helper is not running. Start/install the included PowerShell helper, or add an IP manually.";
+                service.log(`Discovery helper error: ${err}`);
+            }
+        });
+
+        helperSocket.on("disconnected", () => {
+            if (!this.helperCompleted && this.scanStatus.indexOf("not running") < 0) {
+                this.scanStatus = "Discovery helper disconnected before returning results.";
+            }
+        });
+
+        helperSocket.connect(DISCOVERY_HELPER_HOST, DISCOVERY_HELPER_PORT);
+    };
+
+    this.handleHelperMessage = function(line) {
+        let payload;
+        try {
+            payload = JSON.parse(line);
+        } catch (e) {
+            service.log(`Invalid discovery-helper response: ${line}`);
+            return;
+        }
+
+        if (payload.status === "progress") {
+            this.scanStatus = payload.message || "Scanning...";
+            return;
+        }
+
+        if (payload.status === "error") {
+            this.helperCompleted = true;
+            this.scanStatus = payload.message || "Discovery failed.";
+            service.log(this.scanStatus);
+            this.closeHelperSocket();
+            return;
+        }
+
+        if (payload.status !== "ok") {
+            return;
+        }
+
+        const found = Array.isArray(payload.found) ? payload.found : [];
+        for (const ip of found) {
+            this.addKeyLight(ip);
+        }
+
+        this.helperCompleted = true;
+
+        const subnetText = Array.isArray(payload.subnets) && payload.subnets.length > 0
+            ? ` across ${payload.subnets.join(", ")}`
+            : "";
+
+        const skippedText = Array.isArray(payload.skipped) && payload.skipped.length > 0
+            ? ` Skipped: ${payload.skipped.join("; ")}`
+            : "";
+
+        this.scanStatus = found.length > 0
+            ? `Found ${found.length} Key Light${found.length === 1 ? "" : "s"}${subnetText}.${skippedText}`
+            : `No Key Lights found${subnetText}.${skippedText}`;
+
+        this.closeHelperSocket();
+    };
 
     this.addKeyLight = function(ipAddress) {
         const ip = String(ipAddress || "").trim();
@@ -368,6 +530,7 @@ export function DiscoveryService() {
         const ips = this.getSavedIps();
         if (!ips.includes(ip)) {
             ips.push(ip);
+            ips.sort(compareIPv4);
             service.saveSetting(this.storageId, this.storageKey, JSON.stringify(ips));
         }
 
@@ -376,7 +539,8 @@ export function DiscoveryService() {
 
     this.clearSavedKeyLights = function() {
         service.removeSetting(this.storageId, this.storageKey);
-        service.log("Cleared saved Key Light IPs. Restart SignalRGB to remove active instances.");
+        this.scanStatus = "Cleared saved Key Light addresses. Restart SignalRGB to remove active instances.";
+        service.log(this.scanStatus);
     };
 
     this.getSavedIps = function() {
@@ -387,8 +551,9 @@ export function DiscoveryService() {
 
         try {
             const parsed = JSON.parse(saved);
-            return Array.isArray(parsed) ? parsed : [];
+            return Array.isArray(parsed) ? parsed.filter(isValidIPv4) : [];
         } catch (e) {
+            service.log(`Unable to parse saved Key Light IPs: ${e}`);
             return [];
         }
     };
@@ -400,10 +565,21 @@ export function DiscoveryService() {
         if (existing === undefined) {
             const newController = new RazerKeyLightController(ip);
             service.addController(newController);
-            service.announceController(newController);
         } else {
-            existing.obj.updateWithIp(ip);
+            existing.updateWithIp(ip);
         }
+    };
+
+    this.closeHelperSocket = function() {
+        if (this.helperSocket !== null) {
+            try {
+                this.helperSocket.close();
+            } catch (e) {
+                service.log(`Discovery helper socket close warning: ${e}`);
+            }
+        }
+
+        this.helperSocket = null;
     };
 }
 
@@ -413,6 +589,7 @@ class RazerKeyLightController {
         this.ip = ip;
         this.name = `Razer Key Light Chroma ${ip}`;
         this.deviceImage = "https://assets.signalrgb.com/brands/razer/logo.png";
+        this.initialized = false;
     }
 
     updateWithIp(ip) {
@@ -420,10 +597,18 @@ class RazerKeyLightController {
         this.name = `Razer Key Light Chroma ${ip}`;
         service.updateController(this);
     }
+
+    update() {
+        if (!this.initialized) {
+            this.initialized = true;
+            service.updateController(this);
+            service.announceController(this);
+        }
+    }
 }
 
 function isValidIPv4(ip) {
-    const parts = ip.split(".");
+    const parts = String(ip).split(".");
     if (parts.length !== 4) {
         return false;
     }
@@ -432,7 +617,36 @@ function isValidIPv4(ip) {
         if (!/^\d{1,3}$/.test(part)) {
             return false;
         }
+
         const value = Number(part);
         return value >= 0 && value <= 255;
     });
+}
+
+function isValidCidr(cidr) {
+    const parts = String(cidr).split("/");
+    if (parts.length !== 2 || !isValidIPv4(parts[0])) {
+        return false;
+    }
+
+    if (!/^\d{1,2}$/.test(parts[1])) {
+        return false;
+    }
+
+    const prefix = Number(parts[1]);
+    return prefix >= 0 && prefix <= 32;
+}
+
+function compareIPv4(left, right) {
+    return ipv4ToNumber(left) - ipv4ToNumber(right);
+}
+
+function ipv4ToNumber(ip) {
+    const parts = ip.split(".").map(Number);
+    return (
+        ((parts[0] << 24) >>> 0) +
+        ((parts[1] << 16) >>> 0) +
+        ((parts[2] << 8) >>> 0) +
+        parts[3]
+    ) >>> 0;
 }
