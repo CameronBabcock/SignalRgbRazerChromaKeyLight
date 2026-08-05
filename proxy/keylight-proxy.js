@@ -31,7 +31,7 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0"; // keep in sync with the add-on's Version()
 const LISTEN_HOST = "127.0.0.1";
 const LISTEN_PORT = parseInt(process.env.KEYLIGHT_PROXY_PORT || "10077", 10);
 const LIGHT_TCP_PORT = parseInt(process.env.KEYLIGHT_TCP_PORT || "10003", 10);
@@ -41,6 +41,18 @@ const RECONNECT_COOLDOWN_MS = 2000;
 // (fixed 105 bytes) and the socket has NoDelay, so spacing only adds latency.
 const SEND_SPACING_MS = parseInt(process.env.KEYLIGHT_SEND_SPACING_MS || "0", 10);
 const QUEUE_LIMIT = 16;
+
+// A light whose Wi-Fi radio dropped into power-save doze ignores the first
+// connection attempt, but the attempt itself wakes the radio (documented in
+// the original controller project). Retry with widening gaps before giving up.
+const WAKE_RETRY_BACKOFF_MS = [300, 600, 1000, 1500];
+const CONNECT_TIMEOUT_MS = 2000;
+
+// If more than ~3 packets of unsent bytes sit in the socket (Wi-Fi hiccup),
+// hold the queue instead of buffering stale colors behind the congestion;
+// color coalescing keeps only the newest frame while we wait.
+const BACKPRESSURE_BYTES = 315;
+const BACKPRESSURE_POLL_MS = 10;
 
 // C_RGB packets supersede each other: if one is already waiting (e.g. during
 // the handshake), replace it instead of queueing a stale color behind it.
@@ -121,25 +133,47 @@ class Session {
         this.lastActivity = Date.now();
         this.draining = false;
         this.closed = false;
+        this.attempt = 0;
+        this.retryTimer = null;
+        this.backpressureTimer = null;
+        this.socket = null;
 
-        this.socket = net.createConnection({ host: ip, port: LIGHT_TCP_PORT });
-        this.socket.setNoDelay(true);
+        this.openSocket();
+    }
 
-        this.socket.on("connect", () => {
-            log(`[${this.ip}] TCP connected, sending hello`);
-            this.state = "hello-sent";
-            this.socket.write(HELLO_PACKET);
+    openSocket() {
+        this.state = "connecting";
+        const socket = net.createConnection({ host: this.ip, port: LIGHT_TCP_PORT });
+        this.socket = socket;
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 15000);
+        // Inactivity timeout guards the connect/handshake phase; a dozing
+        // light can leave a bare connect hanging for many seconds.
+        socket.setTimeout(CONNECT_TIMEOUT_MS);
+
+        socket.on("timeout", () => {
+            if (this.state !== "ready") {
+                socket.destroy(new Error("connect/handshake timeout"));
+            }
         });
 
-        this.socket.on("data", (data) => {
+        socket.on("connect", () => {
+            log(`[${this.ip}] TCP connected, sending hello`);
+            this.state = "hello-sent";
+            socket.write(HELLO_PACKET);
+        });
+
+        socket.on("data", (data) => {
             if (this.state === "hello-sent") {
                 this.state = "registration-sent";
-                this.socket.write(REGISTRATION_PACKET);
+                socket.write(REGISTRATION_PACKET);
                 return;
             }
 
             if (this.state === "registration-sent") {
                 this.state = "ready";
+                this.attempt = 0;
+                socket.setTimeout(0); // streaming is one-way; silence is normal now
                 log(`[${this.ip}] registration complete, ${this.queue.length} packet(s) queued`);
                 this.drain();
                 return;
@@ -149,15 +183,39 @@ class Session {
             void data;
         });
 
-        this.socket.on("error", (err) => {
+        socket.on("error", (err) => {
             log(`[${this.ip}] TCP error: ${err.message}`);
         });
 
-        this.socket.on("close", () => {
-            if (!this.closed) {
-                log(`[${this.ip}] TCP connection closed`);
+        socket.on("close", () => {
+            if (this.closed) {
+                return;
             }
-            this.dispose("closed by peer or error");
+
+            if (this.state === "ready") {
+                // Established connection dropped; the next packet reopens it
+                // (with fresh wake retries of its own).
+                log(`[${this.ip}] TCP connection closed`);
+                this.dispose("closed by peer or error");
+                return;
+            }
+
+            // Connect or handshake failed — often just a dozing radio that the
+            // attempt itself woke up. Keep the queue and retry with backoff.
+            if (this.attempt < WAKE_RETRY_BACKOFF_MS.length) {
+                const delay = WAKE_RETRY_BACKOFF_MS[this.attempt];
+                this.attempt++;
+                log(`[${this.ip}] connect failed; wake retry ${this.attempt}/${WAKE_RETRY_BACKOFF_MS.length} in ${delay} ms`);
+                this.retryTimer = setTimeout(() => {
+                    this.retryTimer = null;
+                    if (!this.closed) {
+                        this.openSocket();
+                    }
+                }, delay);
+                return;
+            }
+
+            this.dispose(`unreachable after ${WAKE_RETRY_BACKOFF_MS.length + 1} attempts`);
         });
     }
 
@@ -185,26 +243,31 @@ class Session {
             return;
         }
 
-        if (SEND_SPACING_MS <= 0) {
-            // Flush everything back-to-back; the light parses fixed-size frames.
-            let packet;
-            while ((packet = this.queue.shift()) !== undefined) {
-                this.socket.write(Buffer.from(packet));
+        while (this.queue.length > 0) {
+            // Congested socket (Wi-Fi hiccup): pause instead of stacking stale
+            // packets behind it. Coalescing keeps the queued color current.
+            if (this.socket.writableLength > BACKPRESSURE_BYTES) {
+                if (this.backpressureTimer === null) {
+                    this.backpressureTimer = setTimeout(() => {
+                        this.backpressureTimer = null;
+                        this.drain();
+                    }, BACKPRESSURE_POLL_MS);
+                }
+                return;
             }
-            return;
-        }
 
-        const packet = this.queue.shift();
-        if (packet === undefined) {
-            return;
-        }
+            this.socket.write(Buffer.from(this.queue.shift()));
 
-        this.socket.write(Buffer.from(packet));
-        this.draining = true;
-        setTimeout(() => {
-            this.draining = false;
-            this.drain();
-        }, SEND_SPACING_MS);
+            if (SEND_SPACING_MS > 0) {
+                // Optional debug pacing between packets.
+                this.draining = true;
+                setTimeout(() => {
+                    this.draining = false;
+                    this.drain();
+                }, SEND_SPACING_MS);
+                return;
+            }
+        }
     }
 
     dispose(reason) {
@@ -213,7 +276,15 @@ class Session {
         }
         this.closed = true;
         this.queue = [];
-        this.socket.destroy();
+        if (this.retryTimer !== null) {
+            clearTimeout(this.retryTimer);
+        }
+        if (this.backpressureTimer !== null) {
+            clearTimeout(this.backpressureTimer);
+        }
+        if (this.socket !== null) {
+            this.socket.destroy();
+        }
         if (sessions.get(this.ip) === this) {
             sessions.delete(this.ip);
             cooldowns.set(this.ip, Date.now());

@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "Razer Key Light Chroma"; }
-export function Version() { return "0.3.0"; }
+export function Version() { return "0.4.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Community prototype"; }
 export function Size() { return [1, 1]; }
@@ -76,12 +76,12 @@ export function ControllableParameters() {
             property: "updateIntervalMs",
             group: "settings",
             label: "Frame Pacing (ms)",
-            description: "15 ms ≈ 60 FPS, SignalRGB's render cap. Raise this only if the light stutters or drops off Wi-Fi.",
+            description: "10 ms matches SignalRGB's official network add-ons. Raise this only if the light stutters or drops off Wi-Fi.",
             type: "number",
             min: 5,
             max: 250,
             step: 1,
-            default: 15
+            default: 10
         },
         {
             property: "turnOffOnShutdown",
@@ -106,15 +106,21 @@ export function LedPositions() { return LED_POSITIONS; }
 const PROXY_HOST = "127.0.0.1";
 const PROXY_PORT = 10077;
 
-// Re-push the full state periodically so a restarted proxy or power-cycled
-// light recovers without user action. Also serves as the proxy's signal that
-// SignalRGB is still alive (its idle timeout releases the light otherwise).
-const FORCE_RESEND_MS = 2000;
+// Re-push the current color at ~4 Hz even when unchanged. This keeps the
+// light's Wi-Fi radio out of power-save doze between effects (the original
+// project observed a sleeping radio ignoring packets — the "light reacts
+// late" bug), signals the proxy that SignalRGB is alive, and heals state
+// after a proxy restart or light power-cycle.
+const COLOR_REFRESH_MS = 250;
+// Brightness/temperature packets change rarely; re-push them slowly so the
+// white-panel writes don't interleave with the color stream.
+const CONFIG_REFRESH_MS = 10000;
 
 let proxySocket = null;
 let lastColor = [-1, -1, -1];
 let lastConfig = "";
-let lastPushAt = 0;
+let lastColorPushAt = 0;
+let lastConfigPushAt = 0;
 
 export function Initialize() {
     device.setName(`Razer Key Light Chroma (${controller.ip})`);
@@ -132,22 +138,22 @@ export function Initialize() {
 
 export function Render() {
     const now = Date.now();
-    const forceResend = now - lastPushAt >= FORCE_RESEND_MS;
 
     const configKey = `${chromaBrightness}|${mainBrightness}|${colorTemperature}`;
-    if (forceResend || configKey !== lastConfig) {
+    if (configKey !== lastConfig || now - lastConfigPushAt >= CONFIG_REFRESH_MS) {
         sendConfiguration();
         lastConfig = configKey;
+        lastConfigPushAt = now;
     }
 
     const color = LightingMode === "Forced"
         ? hexToRgb(forcedColor)
         : device.color(0, 0);
 
-    if (forceResend || colorChanged(color, lastColor)) {
+    if (colorChanged(color, lastColor) || now - lastColorPushAt >= COLOR_REFRESH_MS) {
         sendPacket(buildPacket("C_RGB", 0, color));
         lastColor = [color[0], color[1], color[2]];
-        lastPushAt = now;
+        lastColorPushAt = now;
     }
 
     device.pause(clampInt(updateIntervalMs, 5, 250));

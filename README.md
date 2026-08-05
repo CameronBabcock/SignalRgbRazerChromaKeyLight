@@ -23,15 +23,22 @@ So this project has two parts:
   ready-to-send 105-byte protocol packets and streams them over **loopback
   UDP** (`127.0.0.1:10077`) using `@SignalRGB/udp`, the one networking module
   proven to work in shipped add-ons. One SignalRGB device per manually entered
-  Key Light IP; only changed colors are sent, with a full state refresh every
-  2 seconds.
+  Key Light IP. Changed colors are sent immediately; the current color is also
+  re-pushed at ~4 Hz even when static, which keeps the light's Wi-Fi radio out
+  of power-save doze (a dozing radio reacts to the first packet of a burst
+  late — the "flashes lag behind the music" effect). Brightness/temperature
+  are re-pushed every 10 seconds.
 - **`proxy/keylight-proxy.js`** — a dependency-free Node.js process that owns
   one persistent TCP connection per light, performs the reverse-engineered
   hello/registration handshake, forwards the add-on's packets verbatim, and
   drains device responses. It opens a light's connection on the first packet
   for it and closes it again after 30 seconds without traffic — so when
   SignalRGB exits (or a light is removed), the light is released for Synapse
-  or other controllers automatically.
+  or other controllers automatically. Because a light whose radio fell asleep
+  ignores the first connection attempt (the attempt itself wakes it), failed
+  connects are retried with widening gaps (0.3/0.6/1/1.5 s) before giving up,
+  and a congestion guard skips stale colors instead of buffering them when
+  Wi-Fi hiccups.
 
 The add-on page shows a live **proxy status line** (it pings the proxy every
 5 seconds), so a missing proxy is visible instead of silently doing nothing.
