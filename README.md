@@ -88,6 +88,12 @@ lower the update interval to `50 ms`.
 
 ## Troubleshooting
 
+- **`could not open module ...@SignalRGB/tcp for reading`:** the add-on runtime
+  only accepts the default-import form used by SignalRGB's official add-ons
+  (`import tcp from "@SignalRGB/tcp";`, no curly braces). If the import is
+  already correct and the error persists, your SignalRGB is older than the
+  `@SignalRGB/tcp` module; update SignalRGB (the official MagicHome add-on
+  requires the same module).
 - **No device appears:** verify the `.js` and `.qml` names match and inspect the
   SignalRGB logs.
 - **Connection refused:** verify the IP and test TCP port `10003`.

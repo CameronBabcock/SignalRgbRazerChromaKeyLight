@@ -1,4 +1,4 @@
-import { tcp } from "@SignalRGB/tcp";
+import tcp from "@SignalRGB/tcp";
 
 export function Name() { return "Razer Key Light Chroma"; }
 export function Version() { return "0.1.0"; }
@@ -158,13 +158,15 @@ function connect() {
     lastConnectAttempt = Date.now();
     socket = tcp.createSocket();
 
-    socket.on("connected", () => {
+    // Event names follow the official SignalRGB TCP add-ons (MagicHome):
+    // "connection", "message", and "error".
+    socket.on("connection", () => {
         device.log(`Connected to Key Light at ${controller.ip}:${RAZER_PORT}`);
         protocolState = "hello-sent";
         socket.send(HELLO_PACKET);
     });
 
-    socket.on("message", (data) => {
+    socket.on("message", (msg) => {
         // Reading every response is important for a persistent connection.
         // The original project used blocking recv() calls for the hello and
         // registration responses, then closed the socket after each state push.
@@ -176,27 +178,24 @@ function connect() {
 
         if (protocolState === "registration-sent") {
             protocolState = "ready";
+            // Resetting these makes the next Render() push the full
+            // configuration and current color exactly once.
             lastConfig = "";
             lastColor = [-1, -1, -1];
-            sendConfiguration();
             device.log("Key Light protocol registration completed.");
             return;
         }
 
         // Subsequent replies are intentionally consumed and ignored.
-        void data;
+        void msg;
     });
 
-    socket.on("disconnected", () => {
-        device.log("Key Light disconnected.");
+    socket.on("error", (code, message) => {
+        device.log(`Key Light socket error: ${code} - ${message}`);
         protocolState = "disconnected";
     });
 
-    socket.on("error", (err) => {
-        device.log(`Key Light socket error: ${err}`);
-        protocolState = "disconnected";
-    });
-
+    socket.bind(0);
     socket.connect(controller.ip, RAZER_PORT);
 }
 
@@ -209,6 +208,7 @@ function reconnectIfNeeded() {
 function closeSocket() {
     if (socket !== null) {
         try {
+            socket.disconnect();
             socket.close();
         } catch (e) {
             device.log(`Socket close warning: ${e}`);
@@ -402,7 +402,7 @@ export function DiscoveryService() {
             service.addController(newController);
             service.announceController(newController);
         } else {
-            existing.obj.updateWithIp(ip);
+            existing.updateWithIp(ip);
         }
     };
 }
