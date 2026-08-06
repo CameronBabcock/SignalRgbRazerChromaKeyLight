@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "Razer Key Light Chroma"; }
-export function Version() { return "0.4.0"; }
+export function Version() { return "0.5.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Community prototype"; }
 export function Size() { return [1, 1]; }
@@ -20,7 +20,7 @@ forcedColor:readonly
 chromaBrightness:readonly
 mainBrightness:readonly
 colorTemperature:readonly
-updateIntervalMs:readonly
+framePacingMs:readonly
 turnOffOnShutdown:readonly
 */
 
@@ -73,15 +73,17 @@ export function ControllableParameters() {
             default: 5000
         },
         {
-            property: "updateIntervalMs",
+            // Renamed from updateIntervalMs so SignalRGB picks up the new
+            // default instead of keeping a stale 33/100 ms value from older builds.
+            property: "framePacingMs",
             group: "settings",
             label: "Frame Pacing (ms)",
-            description: "10 ms matches SignalRGB's official network add-ons. Raise this only if the light stutters or drops off Wi-Fi.",
+            description: "5 ms is as fast as SignalRGB's render loop typically goes. Raise only if the light stutters or drops off Wi-Fi.",
             type: "number",
-            min: 5,
-            max: 250,
+            min: 1,
+            max: 100,
             step: 1,
-            default: 10
+            default: 5
         },
         {
             property: "turnOffOnShutdown",
@@ -106,24 +108,27 @@ export function LedPositions() { return LED_POSITIONS; }
 const PROXY_HOST = "127.0.0.1";
 const PROXY_PORT = 10077;
 
-// Re-push the current color at ~4 Hz even when unchanged. This keeps the
-// light's Wi-Fi radio out of power-save doze between effects (the original
-// project observed a sleeping radio ignoring packets — the "light reacts
-// late" bug), signals the proxy that SignalRGB is alive, and heals state
-// after a proxy restart or light power-cycle.
-const COLOR_REFRESH_MS = 250;
-// Brightness/temperature packets change rarely; re-push them slowly so the
-// white-panel writes don't interleave with the color stream.
-const CONFIG_REFRESH_MS = 10000;
+const CMD_FORWARD = 0xa1;
+const CMD_DISCONNECT = 0xa2;
+const CMD_PING = 0xa3;
+const CMD_PONG = 0xa4;
+
+// Keep the radio awake between effect changes. The original controller project
+// documented a sleeping Wi-Fi radio ignoring the first packets of a burst.
+const COLOR_KEEPALIVE_MS = 200;
 
 let proxySocket = null;
 let lastColor = [-1, -1, -1];
 let lastConfig = "";
 let lastColorPushAt = 0;
-let lastConfigPushAt = 0;
+let ipBytes = [0, 0, 0, 0];
+// Prebuilt 110-byte datagram: cmd + 4-byte IP + 105-byte C_RGB packet.
+let colorDatagram = null;
 
 export function Initialize() {
     device.setName(`Razer Key Light Chroma (${controller.ip})`);
+    ipBytes = controller.ip.split(".").map((p) => Number(p));
+    colorDatagram = buildColorDatagramTemplate(ipBytes);
 
     proxySocket = udp.createSocket();
     proxySocket.on("error", (code, message) => {
@@ -134,29 +139,33 @@ export function Initialize() {
     });
     proxySocket.bind(0);
     proxySocket.connect(PROXY_HOST, PROXY_PORT);
+
+    // Push brightness/temperature once at start; afterwards only on change.
+    lastConfig = "";
+    lastColor = [-1, -1, -1];
+    lastColorPushAt = 0;
 }
 
 export function Render() {
     const now = Date.now();
 
     const configKey = `${chromaBrightness}|${mainBrightness}|${colorTemperature}`;
-    if (configKey !== lastConfig || now - lastConfigPushAt >= CONFIG_REFRESH_MS) {
+    if (configKey !== lastConfig) {
         sendConfiguration();
         lastConfig = configKey;
-        lastConfigPushAt = now;
     }
 
     const color = LightingMode === "Forced"
         ? hexToRgb(forcedColor)
         : device.color(0, 0);
 
-    if (colorChanged(color, lastColor) || now - lastColorPushAt >= COLOR_REFRESH_MS) {
-        sendPacket(buildPacket("C_RGB", 0, color));
+    if (colorChanged(color, lastColor) || now - lastColorPushAt >= COLOR_KEEPALIVE_MS) {
+        sendColor(color[0], color[1], color[2]);
         lastColor = [color[0], color[1], color[2]];
         lastColorPushAt = now;
     }
 
-    device.pause(clampInt(updateIntervalMs, 5, 250));
+    device.pause(clampInt(framePacingMs, 1, 100));
 }
 
 export function Shutdown() {
@@ -166,12 +175,10 @@ export function Shutdown() {
 
     if (turnOffOnShutdown) {
         sendPacket(buildPacket("C_BRIGHT", 0));
-        sendPacket(buildPacket("C_RGB", 0, [0, 0, 0]));
+        sendColor(0, 0, 0);
     }
 
-    // Release the light immediately so Synapse or another controller can
-    // take over without waiting for the proxy's idle timeout.
-    sendToProxy({ ip: controller.ip, cmd: "disconnect" });
+    sendBinary([CMD_DISCONNECT, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]]);
 
     try {
         proxySocket.disconnect();
@@ -184,7 +191,6 @@ export function Shutdown() {
 }
 
 function sendConfiguration() {
-    // Keep the white panel at or below 15% while Chroma is active.
     const whitePct = clampInt(mainBrightness, 0, 15);
     const chromaPct = clampInt(chromaBrightness, 1, 100);
     const temperature = clampInt(colorTemperature, 3000, 7000);
@@ -194,18 +200,62 @@ function sendConfiguration() {
     sendPacket(buildPacket("C_BRIGHT", percentToByte(chromaPct)));
 }
 
-function sendPacket(packet) {
-    sendToProxy({ ip: controller.ip, data: packet });
+function sendColor(r, g, b) {
+    if (proxySocket === null || colorDatagram === null) {
+        return;
+    }
+
+    // Mutate the prebuilt datagram in place: RGB at offset 5+19, then
+    // recompute the XOR checksum over bytes [7 .. 107] (protocol bytes 2..102
+    // of the 105-byte frame, which starts at datagram offset 5).
+    colorDatagram[5 + 19] = r;
+    colorDatagram[5 + 20] = g;
+    colorDatagram[5 + 21] = b;
+
+    let checksum = 0;
+    for (let i = 5 + 2; i < 5 + 103; i++) {
+        checksum ^= colorDatagram[i];
+    }
+    colorDatagram[5 + 103] = checksum & 0xff;
+
+    sendBinary(colorDatagram);
 }
 
-function sendToProxy(message) {
+function sendPacket(packet) {
+    const datagram = new Array(5 + packet.length);
+    datagram[0] = CMD_FORWARD;
+    datagram[1] = ipBytes[0];
+    datagram[2] = ipBytes[1];
+    datagram[3] = ipBytes[2];
+    datagram[4] = ipBytes[3];
+    for (let i = 0; i < packet.length; i++) {
+        datagram[5 + i] = packet[i];
+    }
+    sendBinary(datagram);
+}
+
+function sendBinary(bytes) {
     if (proxySocket === null) {
         return;
     }
 
-    if (proxySocket.send(JSON.stringify(message)) === -1) {
+    if (proxySocket.send(bytes) === -1) {
         device.log("Failed to send datagram to key light proxy.");
     }
+}
+
+function buildColorDatagramTemplate(ip) {
+    const packet = buildPacket("C_RGB", 0, [0, 0, 0]);
+    const datagram = new Array(5 + packet.length);
+    datagram[0] = CMD_FORWARD;
+    datagram[1] = ip[0];
+    datagram[2] = ip[1];
+    datagram[3] = ip[2];
+    datagram[4] = ip[3];
+    for (let i = 0; i < packet.length; i++) {
+        datagram[5 + i] = packet[i];
+    }
+    return datagram;
 }
 
 function buildPacket(command, value = 0, rgb = null) {
@@ -240,8 +290,6 @@ function buildPacket(command, value = 0, rgb = null) {
 
     const packet = header.concat(payload);
 
-    // The reverse-engineered protocol pads the packet to 103 bytes before
-    // appending an XOR checksum and trailing zero, for 105 bytes total.
     while (packet.length < 103) {
         packet.push(0x00);
     }
@@ -349,17 +397,34 @@ export function DiscoveryService() {
     this.pingProxy = function() {
         this.lastPingAt = Date.now();
         if (this.pingSocket !== null) {
-            this.pingSocket.send(JSON.stringify({ cmd: "ping" }));
+            // Prefer binary ping; JSON fallback kept for older proxies.
+            if (this.pingSocket.send([CMD_PING]) === -1) {
+                this.pingSocket.send(JSON.stringify({ cmd: "ping" }));
+            }
         }
     };
 
     this.handleProxyMessage = function(msg) {
-        // Shipped add-ons receive datagram text as msg.response (Govee);
-        // fall back to msg.data for runtimes that deliver byte arrays.
+        // Binary pong: 0xA4 | verLen | ver | n | (ip*4 + state)*n
+        const bytes = coerceBytes(msg);
+        if (bytes && bytes.length >= 2 && bytes[0] === CMD_PONG) {
+            const verLen = bytes[1];
+            if (bytes.length >= 2 + verLen + 1) {
+                this.lastPongAt = Date.now();
+                this.proxyVersion = String.fromCharCode(...bytes.slice(2, 2 + verLen));
+                this.proxySessions = bytes[2 + verLen];
+            }
+            return;
+        }
+
+        // JSON pong (compat)
         const raw = msg?.response ?? msg?.data ?? msg;
         let text = raw;
         if (Array.isArray(raw)) {
             text = String.fromCharCode(...raw);
+        }
+        if (typeof text !== "string") {
+            return;
         }
 
         try {
@@ -370,11 +435,10 @@ export function DiscoveryService() {
                 this.proxySessions = Object.keys(reply.sessions ?? {}).length;
             }
         } catch (e) {
-            void e; // not a proxy reply; ignore
+            void e;
         }
     };
 
-    // Read by the QML page.
     this.proxyStatusText = function() {
         if (this.lastPongAt !== 0 && Date.now() - this.lastPongAt <= PONG_TIMEOUT_MS) {
             const version = this.proxyVersion !== "" ? ` v${this.proxyVersion}` : "";
@@ -455,6 +519,26 @@ class RazerKeyLightController {
         this.name = `Razer Key Light Chroma ${ip}`;
         service.updateController(this);
     }
+}
+
+function coerceBytes(msg) {
+    if (!msg) {
+        return null;
+    }
+    if (Array.isArray(msg)) {
+        return msg;
+    }
+    if (Array.isArray(msg.data)) {
+        return msg.data;
+    }
+    if (typeof msg.response === "string") {
+        const out = new Array(msg.response.length);
+        for (let i = 0; i < msg.response.length; i++) {
+            out[i] = msg.response.charCodeAt(i);
+        }
+        return out;
+    }
+    return null;
 }
 
 function isValidIPv4(ip) {

@@ -8,21 +8,21 @@
 // process over loopback UDP, and the proxy owns one persistent TCP
 // connection per light, including the hello/registration handshake.
 //
-// The proxy holds no connection while SignalRGB is idle or closed: sessions
-// are opened on the first packet for a light and torn down after an idle
-// timeout (or an explicit disconnect command), which releases the light for
-// Synapse or other controllers.
-//
-// Datagram format (JSON, one object per datagram):
-//   {"ip": "192.168.1.120", "data": [ ...raw packet bytes... ]}  forward packet
-//   {"ip": "192.168.1.120", "cmd": "disconnect"}                 close session now
-//   {"cmd": "ping"}                                              reply {"cmd":"pong",...}
+// Datagram formats:
+//   Binary (hot path):
+//     0xA1 | a | b | c | d | data...     forward packet to a.b.c.d
+//     0xA2 | a | b | c | d               disconnect a.b.c.d
+//     0xA3                               ping
+//     0xA4 | verLen | ver... | n |       pong
+//            (a b c d | state)*n
+//   JSON (compat / status):
+//     {"ip":"...","data":[...]} / {"ip":"...","cmd":"disconnect"} / {"cmd":"ping"}
 //
 // Configuration (env vars):
 //   KEYLIGHT_PROXY_PORT  UDP port to listen on (loopback only). Default 10077.
-//   KEYLIGHT_TCP_PORT    TCP port of the lights. Default 10003 (override for tests).
+//   KEYLIGHT_TCP_PORT    TCP port of the lights. Default 10003.
 //   KEYLIGHT_IDLE_MS     Close a light's TCP session after this much silence
-//                        from SignalRGB. Default 30000.
+//                        from SignalRGB. Default 90000.
 //   KEYLIGHT_PROXY_LOG   Log file path. Defaults to keylight-proxy.log next to
 //                        this script. Set to "" to disable file logging.
 
@@ -31,16 +31,14 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 
-const VERSION = "0.4.0"; // keep in sync with the add-on's Version()
+const VERSION = "0.5.0";
 const LISTEN_HOST = "127.0.0.1";
 const LISTEN_PORT = parseInt(process.env.KEYLIGHT_PROXY_PORT || "10077", 10);
 const LIGHT_TCP_PORT = parseInt(process.env.KEYLIGHT_TCP_PORT || "10003", 10);
-const IDLE_MS = parseInt(process.env.KEYLIGHT_IDLE_MS || "30000", 10);
-const RECONNECT_COOLDOWN_MS = 2000;
-// Optional pacing between TCP packets. Default 0: packets are framed
-// (fixed 105 bytes) and the socket has NoDelay, so spacing only adds latency.
+const IDLE_MS = parseInt(process.env.KEYLIGHT_IDLE_MS || "90000", 10);
+const RECONNECT_COOLDOWN_MS = 250;
 const SEND_SPACING_MS = parseInt(process.env.KEYLIGHT_SEND_SPACING_MS || "0", 10);
-const QUEUE_LIMIT = 16;
+const QUEUE_LIMIT = 8;
 
 // A light whose Wi-Fi radio dropped into power-save doze ignores the first
 // connection attempt, but the attempt itself wakes the radio (documented in
@@ -48,16 +46,33 @@ const QUEUE_LIMIT = 16;
 const WAKE_RETRY_BACKOFF_MS = [300, 600, 1000, 1500];
 const CONNECT_TIMEOUT_MS = 2000;
 
-// If more than ~3 packets of unsent bytes sit in the socket (Wi-Fi hiccup),
+// If more than ~2 packets of unsent bytes sit in the socket (Wi-Fi hiccup),
 // hold the queue instead of buffering stale colors behind the congestion;
 // color coalescing keeps only the newest frame while we wait.
-const BACKPRESSURE_BYTES = 315;
-const BACKPRESSURE_POLL_MS = 10;
+const BACKPRESSURE_BYTES = 210;
+const BACKPRESSURE_POLL_MS = 5;
 
-// C_RGB packets supersede each other: if one is already waiting (e.g. during
-// the handshake), replace it instead of queueing a stale color behind it.
+const CMD_FORWARD = 0xa1;
+const CMD_DISCONNECT = 0xa2;
+const CMD_PING = 0xa3;
+const CMD_PONG = 0xa4;
+
+// Session states encoded in pong replies
+const STATE_CODE = {
+    connecting: 1,
+    "hello-sent": 2,
+    "registration-sent": 3,
+    ready: 4
+};
+const STATE_NAME = {
+    1: "connecting",
+    2: "hello-sent",
+    3: "registration-sent",
+    4: "ready"
+};
+
 function isColorPacket(bytes) {
-    return bytes[10] === 0x0c && bytes[11] === 0x0f && bytes[12] === 0x02;
+    return bytes.length >= 13 && bytes[10] === 0x0c && bytes[11] === 0x0f && bytes[12] === 0x02;
 }
 
 // ----------------------------- logging --------------------------------------
@@ -68,7 +83,6 @@ const LOG_PATH = process.env.KEYLIGHT_PROXY_LOG !== undefined
 
 if (LOG_PATH) {
     try {
-        // Rotate if larger than 5 MB to avoid unbounded growth.
         if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > 5 * 1024 * 1024) {
             fs.renameSync(LOG_PATH, LOG_PATH + ".1");
         }
@@ -95,8 +109,6 @@ const HELLO_PACKET = Buffer.from([
     0x01, 0x09, 0x00, 0x11, 0x00, 0x00, 0x40, 0x15, 0x00
 ]);
 
-// Registration payload from the reverse-engineered protocol
-// ("H\0I\1...Synapse3"). Packet framing matches the add-on's buildPacket().
 function buildRegistrationPacket() {
     const header = [0xaa, 0x00, 0x00, 0x5f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     const payload = Array.from(Buffer.from("48004901d45d645125220853796e6170736533", "hex"));
@@ -120,15 +132,13 @@ const REGISTRATION_PACKET = buildRegistrationPacket();
 
 // ----------------------------- TCP sessions ---------------------------------
 
-// ip -> Session
 const sessions = new Map();
-// ip -> timestamp of last failed/closed connection, for reconnect cooldown
 const cooldowns = new Map();
 
 class Session {
     constructor(ip) {
         this.ip = ip;
-        this.state = "connecting"; // connecting | hello-sent | registration-sent | ready
+        this.state = "connecting";
         this.queue = [];
         this.lastActivity = Date.now();
         this.draining = false;
@@ -146,9 +156,7 @@ class Session {
         const socket = net.createConnection({ host: this.ip, port: LIGHT_TCP_PORT });
         this.socket = socket;
         socket.setNoDelay(true);
-        socket.setKeepAlive(true, 15000);
-        // Inactivity timeout guards the connect/handshake phase; a dozing
-        // light can leave a bare connect hanging for many seconds.
+        socket.setKeepAlive(true, 10000);
         socket.setTimeout(CONNECT_TIMEOUT_MS);
 
         socket.on("timeout", () => {
@@ -173,13 +181,12 @@ class Session {
             if (this.state === "registration-sent") {
                 this.state = "ready";
                 this.attempt = 0;
-                socket.setTimeout(0); // streaming is one-way; silence is normal now
+                socket.setTimeout(0);
                 log(`[${this.ip}] registration complete, ${this.queue.length} packet(s) queued`);
                 this.drain();
                 return;
             }
 
-            // Later replies are drained and ignored to keep the connection healthy.
             void data;
         });
 
@@ -193,15 +200,11 @@ class Session {
             }
 
             if (this.state === "ready") {
-                // Established connection dropped; the next packet reopens it
-                // (with fresh wake retries of its own).
                 log(`[${this.ip}] TCP connection closed`);
                 this.dispose("closed by peer or error");
                 return;
             }
 
-            // Connect or handshake failed — often just a dozing radio that the
-            // attempt itself woke up. Keep the queue and retry with backoff.
             if (this.attempt < WAKE_RETRY_BACKOFF_MS.length) {
                 const delay = WAKE_RETRY_BACKOFF_MS[this.attempt];
                 this.attempt++;
@@ -221,31 +224,45 @@ class Session {
 
     enqueue(bytes) {
         this.lastActivity = Date.now();
+        const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
 
-        if (isColorPacket(bytes)) {
+        // Fast path: session ready, socket not congested, nothing queued —
+        // write the color (or any packet) immediately with no array churn.
+        if (
+            this.state === "ready"
+            && !this.closed
+            && this.queue.length === 0
+            && this.socket
+            && this.socket.writableLength <= BACKPRESSURE_BYTES
+        ) {
+            this.socket.write(buf);
+            return;
+        }
+
+        if (isColorPacket(buf)) {
             const waitingColor = this.queue.findIndex(isColorPacket);
             if (waitingColor !== -1) {
-                this.queue[waitingColor] = bytes;
+                this.queue[waitingColor] = buf;
                 this.drain();
                 return;
             }
         }
 
-        this.queue.push(bytes);
+        this.queue.push(buf);
         if (this.queue.length > QUEUE_LIMIT) {
-            this.queue.shift();
+            // Drop oldest non-essential packet; prefer keeping newest color.
+            const dropAt = this.queue.findIndex((p, i) => i < this.queue.length - 1 && isColorPacket(p));
+            this.queue.splice(dropAt === -1 ? 0 : dropAt, 1);
         }
         this.drain();
     }
 
     drain() {
-        if (this.draining || this.state !== "ready" || this.closed) {
+        if (this.draining || this.state !== "ready" || this.closed || !this.socket) {
             return;
         }
 
         while (this.queue.length > 0) {
-            // Congested socket (Wi-Fi hiccup): pause instead of stacking stale
-            // packets behind it. Coalescing keeps the queued color current.
             if (this.socket.writableLength > BACKPRESSURE_BYTES) {
                 if (this.backpressureTimer === null) {
                     this.backpressureTimer = setTimeout(() => {
@@ -256,10 +273,9 @@ class Session {
                 return;
             }
 
-            this.socket.write(Buffer.from(this.queue.shift()));
+            this.socket.write(this.queue.shift());
 
             if (SEND_SPACING_MS > 0) {
-                // Optional debug pacing between packets.
                 this.draining = true;
                 setTimeout(() => {
                     this.draining = false;
@@ -301,13 +317,56 @@ function getOrCreateSession(ip) {
 
     const lastFailure = cooldowns.get(ip) ?? 0;
     if (Date.now() - lastFailure < RECONNECT_COOLDOWN_MS) {
-        return undefined; // still cooling down; drop the packet, the add-on re-sends
+        return undefined;
     }
 
     log(`[${ip}] opening TCP session to port ${LIGHT_TCP_PORT}`);
     const session = new Session(ip);
     sessions.set(ip, session);
     return session;
+}
+
+function ipFromBytes(buf, offset) {
+    return `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
+}
+
+function buildPong() {
+    const ver = Buffer.from(VERSION, "utf8");
+    const entries = [...sessions.entries()];
+    const out = Buffer.alloc(2 + ver.length + 1 + entries.length * 5);
+    let o = 0;
+    out[o++] = CMD_PONG;
+    out[o++] = ver.length;
+    ver.copy(out, o);
+    o += ver.length;
+    out[o++] = entries.length;
+    for (const [ip, session] of entries) {
+        const parts = ip.split(".").map(Number);
+        out[o++] = parts[0];
+        out[o++] = parts[1];
+        out[o++] = parts[2];
+        out[o++] = parts[3];
+        out[o++] = STATE_CODE[session.state] || 0;
+    }
+    return out;
+}
+
+function handlePing(rinfo) {
+    server.send(buildPong(), rinfo.port, rinfo.address);
+}
+
+function handleForward(ip, data) {
+    const session = getOrCreateSession(ip);
+    if (session !== undefined) {
+        session.enqueue(data);
+    }
+}
+
+function handleDisconnect(ip) {
+    const session = sessions.get(ip);
+    if (session !== undefined) {
+        session.dispose("disconnect requested by add-on");
+    }
 }
 
 // Idle sweep: release lights SignalRGB stopped talking about (or SignalRGB quit).
@@ -326,43 +385,58 @@ setInterval(() => {
 const server = dgram.createSocket("udp4");
 
 server.on("message", (raw, rinfo) => {
-    let msg;
-    try {
-        msg = JSON.parse(raw.toString());
-    } catch (e) {
-        log(`Ignoring malformed datagram from ${rinfo.address}:${rinfo.port}: ${e.message}`);
+    if (raw.length === 0) {
         return;
     }
 
-    if (msg.cmd === "ping") {
-        const states = {};
-        for (const [ip, session] of sessions) {
-            states[ip] = session.state;
+    // Binary hot path
+    const cmd = raw[0];
+    if (cmd === CMD_PING) {
+        handlePing(rinfo);
+        return;
+    }
+    if (cmd === CMD_FORWARD && raw.length > 5) {
+        handleForward(ipFromBytes(raw, 1), raw.subarray(5));
+        return;
+    }
+    if (cmd === CMD_DISCONNECT && raw.length >= 5) {
+        handleDisconnect(ipFromBytes(raw, 1));
+        return;
+    }
+
+    // JSON compatibility path (status / older add-on builds)
+    if (raw[0] === 0x7b) { // '{'
+        let msg;
+        try {
+            msg = JSON.parse(raw.toString());
+        } catch (e) {
+            log(`Ignoring malformed datagram from ${rinfo.address}:${rinfo.port}: ${e.message}`);
+            return;
         }
-        const pong = JSON.stringify({ cmd: "pong", version: VERSION, sessions: states });
-        server.send(pong, rinfo.port, rinfo.address);
-        return;
-    }
 
-    if (typeof msg.ip !== "string" || net.isIPv4(msg.ip) === false) {
-        log(`Ignoring datagram without valid "ip" from ${rinfo.address}:${rinfo.port}`);
-        return;
-    }
+        if (msg.cmd === "ping") {
+            // Keep JSON pong for older UIs that parse text replies.
+            const states = {};
+            for (const [ip, session] of sessions) {
+                states[ip] = session.state;
+            }
+            server.send(JSON.stringify({ cmd: "pong", version: VERSION, sessions: states }), rinfo.port, rinfo.address);
+            return;
+        }
 
-    if (msg.cmd === "disconnect") {
-        const session = sessions.get(msg.ip);
-        if (session !== undefined) {
-            session.dispose("disconnect requested by add-on");
+        if (typeof msg.ip === "string" && net.isIPv4(msg.ip)) {
+            if (msg.cmd === "disconnect") {
+                handleDisconnect(msg.ip);
+                return;
+            }
+            if (Array.isArray(msg.data) && msg.data.length > 0) {
+                handleForward(msg.ip, Buffer.from(msg.data));
+            }
         }
         return;
     }
 
-    if (Array.isArray(msg.data) && msg.data.length > 0) {
-        const session = getOrCreateSession(msg.ip);
-        if (session !== undefined) {
-            session.enqueue(msg.data);
-        }
-    }
+    log(`Ignoring unknown datagram (${raw.length} bytes) from ${rinfo.address}:${rinfo.port}`);
 });
 
 server.on("error", (err) => {
@@ -386,3 +460,6 @@ function shutdown() {
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// Silence unused-lint style for STATE_NAME in case we expand diagnostics later.
+void STATE_NAME;
